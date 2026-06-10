@@ -7,8 +7,28 @@ import Topic from '../models/Topic.js'
 
 const router = Router()
 
-// ── Helper: extract email từ context.user_url ──
-const resolveUser = async (userString = '', context = {}) => {
+// ── Helper ──
+const resolveUser = async (userString = '', context = {}, userId = '') => {
+  console.log('[resolveUser] userString:', userString, '| userId:', userId)
+
+  // 1. user_id chứa email trực tiếp (khi login Portal)
+  if (userId && userId.includes('@')) {
+    return User.findOne({ email: userId.trim().toLowerCase() })
+  }
+
+  // 2. embed-user / demo-user / null → dùng .env
+  if (!userId || userString === 'embed-user' || userString === 'demo-user') {
+    const demoEmail = process.env.AI_PORTAL_DEMO_EMAIL
+    console.log('[resolveUser] demoEmail:', demoEmail)
+    if (demoEmail) {
+      const found = await User.findOne({ email: demoEmail.toLowerCase() })
+      console.log('[resolveUser] found:', found?.email || 'NULL')
+      return found
+    }
+    return null
+  }
+
+  // 3. Từ user_url
   if (context?.user_url) {
     const match = context.user_url.match(/\/email\/(.+)$/)
     if (match) {
@@ -16,11 +36,19 @@ const resolveUser = async (userString = '', context = {}) => {
       return User.findOne({ email: email.trim().toLowerCase() })
     }
   }
+
+  // 4. Email trực tiếp
   if (typeof userString === 'string' && userString.includes('@')) {
     return User.findOne({ email: userString.trim().toLowerCase() })
   }
+
   return null
 }
+
+const needLogin = () => ({
+  status: 'success',
+  content_markdown: `Bạn cần **đăng nhập DailyDictation** để xem thông tin này.`,
+})
 
 // ── 1. GET /metadata ──
 router.get('/metadata', (req, res) => {
@@ -41,14 +69,15 @@ router.get('/metadata', (req, res) => {
 
 // ── 2. POST /ask ──
 router.post('/ask', async (req, res) => {
-  console.log('[aiPortal] body:', JSON.stringify(req.body, null, 2))
-  const { prompt = '', user: userString, context = {} } = req.body
+  console.log('[aiPortal] /ask HIT')
+  const { prompt = '', user: userString, context = {}, user_id: userId = '' } = req.body
   const text = prompt.toLowerCase().trim()
 
   try {
-    const user = await resolveUser(userString, context)
+    const user = await resolveUser(userString, context, userId)
+    console.log('[aiPortal] user found:', user?.email || 'NULL')
 
-    // Tra từ — xử lý hoàn toàn trong aiPortal
+    // Tra từ
     if (
       text.includes('nghĩa là gì') ||
       text.includes('nghĩa của') ||
@@ -64,8 +93,7 @@ router.post('/ask', async (req, res) => {
         ?.toLowerCase()
         .replace(/[^a-z']/g, '')
 
-      console.log('[aiPortal] extracted word:', word)  // ← thêm dòng này
-      console.log('[aiPortal] text:', text)
+      console.log('[aiPortal] word:', word)
 
       try {
         const [dictRes, transRes] = await Promise.allSettled([
@@ -73,13 +101,11 @@ router.post('/ask', async (req, res) => {
           fetch(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(word)}&langpair=en|vi`)
         ])
 
-        // ── Đọc JSON 1 lần ──
         let dictData = null
         if (dictRes.status === 'fulfilled' && dictRes.value.ok) {
-          dictData = await dictRes.value.json()  // chỉ .json() 1 lần
+          dictData = await dictRes.value.json()
         }
 
-        // IPA — dùng dictData
         let ukIpa = null, usIpa = null
         if (dictData) {
           const entry = dictData[0]
@@ -88,14 +114,12 @@ router.post('/ask', async (req, res) => {
           usIpa = phonetics.find(p => p.audio?.includes('-us'))?.text || phonetics.find(p => !p.audio?.includes('-uk') && p.text)?.text || entry?.phonetic
         }
 
-        // Translation
         let translation = null
         if (transRes.status === 'fulfilled' && transRes.value.ok) {
           const data = await transRes.value.json()
           if (data.responseStatus === 200) translation = data.responseData.translatedText
         }
 
-        // Meanings — dùng lại dictData (không fetch lại)
         let meaningsText = ''
         if (dictData) {
           const meanings = dictData[0]?.meanings || []
@@ -120,19 +144,15 @@ router.post('/ask', async (req, res) => {
           content_markdown:
             `## 📖 ${word}\n\n` +
             `🇬🇧 \`${ukIpa || 'N/A'}\` · 🇺🇸 \`${usIpa || 'N/A'}\`\n` +
-            `🇻🇳 **${translation || 'N/A'}**\n\n` +
-            `---\n\n` +
+            `🇻🇳 **${translation || 'N/A'}**\n\n---\n\n` +
             meaningsText,
         })
       } catch (err) {
-        return res.json({
-          status: 'success',
-          content_markdown: `Lỗi tra từ: ${err.message}`,
-        })
+        return res.json({ status: 'success', content_markdown: `Lỗi tra từ: ${err.message}` })
       }
     }
 
-    // Tiến độ tổng quan
+    // Tiến độ
     if (text.includes('tiến độ') || text.includes('bao nhiêu bài') || text.includes('hoàn thành')) {
       if (!user) return res.json(needLogin())
       const [completed, inProgress, total] = await Promise.all([
@@ -165,7 +185,7 @@ router.post('/ask', async (req, res) => {
           content_markdown: `Bạn không có bài nào đang dở dang. Hãy bắt đầu bài mới nhé! 🎯`,
         })
       }
-      const lines = list.map((p) => `- **${p.lessonId?.title}** — câu ${p.currentSentence + 1}`).join('\n')
+      const lines = list.map(p => `- **${p.lessonId?.title}** — câu ${p.currentSentence + 1}`).join('\n')
       return res.json({
         status: 'success',
         content_markdown: `## Bài đang học dở 📖\n\n${lines}`,
@@ -176,7 +196,7 @@ router.post('/ask', async (req, res) => {
     if (text.includes('gợi ý') || text.includes('nên học') || text.includes('bài nào')) {
       if (!user) {
         const starters = await Lesson.find().limit(3).select('title slug')
-        const lines = starters.map((l) => `- **${l.title}**`).join('\n')
+        const lines = starters.map(l => `- **${l.title}**`).join('\n')
         return res.json({
           status: 'success',
           content_markdown: `## Gợi ý bài học 🌱\n\n${lines}\n\n> Đăng nhập để nhận gợi ý cá nhân hoá.`,
@@ -184,15 +204,12 @@ router.post('/ask', async (req, res) => {
       }
       const completedIds = (
         await Progress.find({ userId: user._id, status: 'completed' }).select('lessonId')
-      ).map((p) => String(p.lessonId))
+      ).map(p => String(p.lessonId))
       const suggested = await Lesson.find({ _id: { $nin: completedIds } }).limit(3).select('title slug')
       if (suggested.length === 0) {
-        return res.json({
-          status: 'success',
-          content_markdown: `🎉 Bạn đã hoàn thành tất cả bài học có sẵn!`,
-        })
+        return res.json({ status: 'success', content_markdown: `🎉 Bạn đã hoàn thành tất cả bài học có sẵn!` })
       }
-      const lines = suggested.map((l) => `- **${l.title}**`).join('\n')
+      const lines = suggested.map(l => `- **${l.title}**`).join('\n')
       return res.json({
         status: 'success',
         content_markdown: `## Gợi ý bài tiếp theo 🎯\n\n${lines}`,
@@ -253,12 +270,6 @@ router.get('/data', async (req, res) => {
   } catch (err) {
     res.status(500).json({ status: 'error', error_message: err.message, items: [] })
   }
-})
-
-// ── Helper ──
-const needLogin = () => ({
-  status: 'success',
-  content_markdown: `Bạn cần **đăng nhập DailyDictation** để xem thông tin này.`,
 })
 
 export default router
